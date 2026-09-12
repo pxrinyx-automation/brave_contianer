@@ -135,7 +135,7 @@ export function planMoves(tabs, records) {
 }
 
 export function startScheduler(chromeApi) {
-  const { tabs, storage: { session }, commands, action } = chromeApi;
+  const { tabs, storage: { local }, commands, action } = chromeApi;
   const queues = new Map();
   const pending = new Set();
   const detachedWindows = new Map();
@@ -163,7 +163,7 @@ export function startScheduler(chromeApi) {
   const allocateSequence = () => {
     const allocated = sequenceQueue.then(async () => {
       if (sequence === undefined) {
-        const values = await session.get(null);
+        const values = await local.get(null);
         sequence = Math.max(0, ...Object.values(values)
           .map((value) => value?.sequence)
           .filter((value) => Number.isSafeInteger(value) && value >= 0));
@@ -182,7 +182,7 @@ export function startScheduler(chromeApi) {
     try {
       [windowTabs, records] = await Promise.all([
         tabs.query({ windowId, windowType: "normal" }),
-        session.get(null),
+        local.get(null),
       ]);
     } catch (error) {
       // Best-effort: a failed sort is repaired by the next event/command,
@@ -208,7 +208,7 @@ export function startScheduler(chromeApi) {
     if (!action) return;
     const [allTabs, records] = await Promise.all([
       tabs.query({ windowType: "normal" }),
-      session.get(null),
+      local.get(null),
     ]);
     const count = allTabs.filter((tab) => {
       const value = records[`${RECORD_PREFIX}${tab.id}`];
@@ -239,17 +239,17 @@ export function startScheduler(chromeApi) {
     if (!marker) {
       if (normalizeUnpinned) {
         const key = `${RECORD_PREFIX}${tabId}`;
-        if ((await session.get(key))[key]) await normalize(windowId);
+        if ((await local.get(key))[key]) await normalize(windowId);
       }
       return;
     }
 
     const key = `${RECORD_PREFIX}${tabId}`;
-    const existing = (await session.get(key))[key];
+    const existing = (await local.get(key))[key];
     const isNew = existing?.nonce !== marker.nonce || existing?.slot !== marker.slot
       || !Number.isSafeInteger(existing?.sequence) || existing.sequence < 0;
     if (isNew) {
-      await session.set({
+      await local.set({
         [key]: { slot: marker.slot, sequence: await allocateSequence(), nonce: marker.nonce },
       });
     }
@@ -268,12 +268,12 @@ export function startScheduler(chromeApi) {
   tabs.onMoved.addListener((tabId, moveInfo) => {
     track(enqueue(moveInfo.windowId, async () => {
       const key = `${RECORD_PREFIX}${tabId}`;
-      if ((await session.get(key))[key]) await normalize(moveInfo.windowId);
+      if ((await local.get(key))[key]) await normalize(moveInfo.windowId);
     }));
   });
   tabs.onRemoved.addListener((tabId, removeInfo) => {
     track(enqueue(removeInfo.windowId, async () => {
-      await session.remove(`${RECORD_PREFIX}${tabId}`);
+      await local.remove(`${RECORD_PREFIX}${tabId}`);
       await normalize(removeInfo.windowId);
     }));
   });
@@ -286,17 +286,17 @@ export function startScheduler(chromeApi) {
       } catch (error) {
         logError("onReplaced:get", error);
         await Promise.allSettled([...queues.values()]);
-        await session.remove(oldKey);
+        await local.remove(oldKey);
         return;
       }
       await enqueue(tab.windowId, async () => {
-        const record = (await session.get(oldKey))[oldKey];
+        const record = (await local.get(oldKey))[oldKey];
         if (!record) {
           await processTab(addedTabId, tab.windowId);
           return;
         }
-        await session.set({ [`${RECORD_PREFIX}${addedTabId}`]: record });
-        await session.remove(oldKey);
+        await local.set({ [`${RECORD_PREFIX}${addedTabId}`]: record });
+        await local.remove(oldKey);
         await normalize(tab.windowId);
       });
     })());
@@ -305,7 +305,7 @@ export function startScheduler(chromeApi) {
     detachedWindows.set(tabId, detachInfo.oldWindowId);
     track(enqueue(detachInfo.oldWindowId, async () => {
       const key = `${RECORD_PREFIX}${tabId}`;
-      if ((await session.get(key))[key]) await normalize(detachInfo.oldWindowId);
+      if ((await local.get(key))[key]) await normalize(detachInfo.oldWindowId);
     }));
   });
   tabs.onAttached.addListener((tabId, attachInfo) => {
@@ -316,7 +316,7 @@ export function startScheduler(chromeApi) {
     }
     track(enqueue(attachInfo.newWindowId, async () => {
       const key = `${RECORD_PREFIX}${tabId}`;
-      if ((await session.get(key))[key]) await normalize(attachInfo.newWindowId);
+      if ((await local.get(key))[key]) await normalize(attachInfo.newWindowId);
     }));
   });
   commands.onCommand.addListener((command) => {
@@ -328,6 +328,18 @@ export function startScheduler(chromeApi) {
       await reportManagedCount();
     })());
   });
+
+  // Records live in storage.local so they survive an extension reload (tab
+  // ids are stable across that), but tab ids do NOT survive a browser
+  // restart -- a record for a tab that no longer exists would otherwise sit
+  // there forever. Prune once, at worker start.
+  track((async () => {
+    const [allTabs, storedRecords] = await Promise.all([tabs.query({}), local.get(null)]);
+    const liveIds = new Set(allTabs.map((tab) => tab.id));
+    const stale = Object.keys(storedRecords).filter((key) => key.startsWith(RECORD_PREFIX)
+      && !liveIds.has(Number(key.slice(RECORD_PREFIX.length))));
+    if (stale.length) await local.remove(stale);
+  })());
 
   return {
     async drain() {

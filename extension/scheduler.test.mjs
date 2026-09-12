@@ -109,7 +109,7 @@ function fakeChrome(initialTabs = []) {
       },
     },
     storage: {
-      session: {
+      local: {
         async get(keys) {
           if ((keys === null && api._failGets.has("storage:all"))
             || (keys !== null && [...(Array.isArray(keys) ? keys : [keys])]
@@ -618,6 +618,21 @@ test("close, replacement, and cross-window attachment maintain session records",
   assert.ok(chromeApi._calls.query.some(({ windowId }) => windowId === 1));
 });
 
+test("startup prunes managed-tab records for tabs that no longer exist", async () => {
+  // Tab ids do not survive a browser restart, so a record left over from a
+  // previous session points at a tab that will never come back. Prune it on
+  // worker start rather than leaving it dead forever.
+  const chromeApi = wireFake(fakeChrome([
+    { id: 1, windowId: 1, index: 0, url: "https://example.com/still-here" },
+  ]));
+  chromeApi._stored["managed-tab:1"] = record(1, 1);
+  chromeApi._stored["managed-tab:99"] = record(2, 2); // tab 99 does not exist
+  chromeApi._scheduler = startScheduler(chromeApi);
+  await drain(chromeApi);
+  assert.ok(chromeApi._stored["managed-tab:1"], "record for a live tab must survive");
+  assert.equal("managed-tab:99" in chromeApi._stored, false, "record for a gone tab must be pruned");
+});
+
 test("sort-all-managed normalizes every normal window", async () => {
   const chromeApi = wireFake(fakeChrome([
     { id: 2, windowId: 1, index: 0, url: "https://example.com/2" },
@@ -767,17 +782,17 @@ test("missing tabs, failed storage, query, and update calls recover on later eve
 test("a new marker tab still navigates to its target when normalize fails", async () => {
   // Reported live bug: processTab awaited normalize(windowId) BEFORE
   // tabs.update, so any rejection inside normalize (a failed tabs.query or
-  // session.get) left the tab stranded on the brave-container.invalid error
+  // local.get) left the tab stranded on the brave-container.invalid error
   // page forever -- the marker was recorded but never consumed. Navigation
   // must not depend on the sort succeeding.
   const chromeApi = wireFake(fakeChrome([
     { id: 1, windowId: 1, index: 0, url: openMarker(2, "first") },
   ]));
   chromeApi._events.onCreated.emit({ id: 1, windowId: 1 });
-  await drain(chromeApi); // primes allocateSequence's one-time session.get(null)
+  await drain(chromeApi); // primes allocateSequence's one-time local.get(null)
 
   chromeApi._tabs.push({ id: 2, windowId: 1, index: 1, url: openMarker(1, "second") });
-  chromeApi._failGets.add("storage:all"); // normalize's session.get(null) now fails
+  chromeApi._failGets.add("storage:all"); // normalize's local.get(null) now fails
   chromeApi._events.onCreated.emit({ id: 2, windowId: 1 });
   await drain(chromeApi);
 
