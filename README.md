@@ -22,7 +22,7 @@ browser patching.
 Ctrl+Shift+N  ->  GNOME custom keybinding  ->  brave_container.py open N
                                                  -> detect running/installed Brave
                                                  -> read Preferences, find Nth container
-                                                 -> brave --user-data-dir=<dir> --container=<name> about:blank
+                                                 -> brave --user-data-dir=<dir> --container=<name> https://www.google.com/
 ```
 
 Slot N = the **Nth entry** in Brave's own container list
@@ -69,9 +69,11 @@ filtered by `chrome/browser/ui/startup/url_util.cc`
 approved settings page, and exactly `about:blank` are allowed;
 `chrome://`/`brave://` need headless mode + `--allow-chrome-scheme-url`,
 which brave-core doesn't patch around. So the new-tab-page target is
-unreachable through `--container`; `about:blank` is the closest working
-substitute (a real tab, in the right container, in the existing window).
-Use `open N --url <address>` to target something else instead.
+unreachable through `--container`. The launcher instead defaults to
+`https://www.google.com/`, a web-safe URL that opens as a real tab in the
+right container and existing window. Use `open N --url <address>` to
+override it; an empty `--url` is rejected so a required tab URL cannot be
+removed.
 
 ## Install
 
@@ -88,7 +90,7 @@ Press `Ctrl+Shift+1` .. `Ctrl+Shift+9`.
 
 | Command | What it does |
 |---|---|
-| `open N [--dry-run] [--url URL]` | Open a tab (default `about:blank`) in slot N's container (or print the argv) |
+| `open N [--dry-run] [--url URL]` | Open a tab (default `https://www.google.com/`) in slot N's container (or print the argv) |
 | `list` | Show slot -> container name for the detected Brave |
 | `doctor` | Session type, detected Brave (pid/channel/user-data-dir), Wayland-native check, container list, keybinding conflicts |
 | `install [--dry-run]` | Bind `Ctrl+Shift+1-9` via GNOME's `custom-keybindings` gsettings |
@@ -150,4 +152,12 @@ uninstall` first so the two don't both claim `Ctrl+Shift+N`.
 python3 -m unittest -v test_brave_container            # pure-function unit tests
 BRAVE_SHORTCUT_E2E=1 python3 -m unittest -v test_brave_container.EndToEndTest
 ```
-The E2E test is opt-in and read/dry-run only — it never launches Brave.
+The E2E test is opt-in and read/dry-run only — it never launches Brave. It
+covers slots 1-9; unconfigured slots safely do nothing.
+
+For a final live check, start Brave first, record its browser PID, then run
+`./brave_container.py open 1`. Confirm the original PID is still the only
+main Brave process and visually confirm a Google tab in the existing window
+has the Personal-container badge; leave that tab open. Re-read GNOME's
+custom bindings afterward: `custom0` must remain Ghostty and `custom1`-
+`custom9` must remain slots 1-9.

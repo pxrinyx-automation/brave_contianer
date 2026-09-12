@@ -130,12 +130,14 @@ def profile_dir_for(argv):
     return _switch_value(argv, "profile-directory") or "Default"
 
 
-NEW_TAB_URL = "about:blank"
-"""The only allowlisted command-line URL close to a blank new tab.
-brave://newtab is rejected by Chromium's launch-URL filter
-(chrome/browser/ui/startup/url_util.cc ValidateLaunchUrlWebUnsafe accepts
-only web-safe schemes, file://, an approved settings page, and exactly
-about:blank) -- confirmed live on this machine."""
+NEW_TAB_URL = "https://www.google.com/"
+
+
+def non_empty_url(value):
+    """Reject an explicit empty URL so every launch has a tab target."""
+    if not value:
+        raise argparse.ArgumentTypeError("URL must not be empty")
+    return value
 
 
 def build_argv(exe, passthrough, name, url=None):
@@ -440,7 +442,7 @@ def main(argv=None):
     p_open = sub.add_parser("open", help="open a new tab in slot N")
     p_open.add_argument("slot", type=int)
     p_open.add_argument("--dry-run", action="store_true")
-    p_open.add_argument("--url", default=None,
+    p_open.add_argument("--url", type=non_empty_url, default=None,
                          help="override the new-tab URL (default: %s)"
                          % NEW_TAB_URL)
 

@@ -1,4 +1,6 @@
 """Tests for brave_container.py — stdlib unittest, no external deps."""
+import contextlib
+import io
 import os
 import unittest
 
@@ -29,6 +31,11 @@ class ContainerForSlotTest(unittest.TestCase):
     def test_slot_4_is_fourth_container(self):
         self.assertEqual(bc.container_for_slot(self.prefs, 4),
                           {"id": "id-4", "name": "dev1"})
+
+    def test_all_configured_slots_resolve_in_order(self):
+        self.assertEqual(
+            [bc.container_for_slot(self.prefs, n)["name"] for n in range(1, 7)],
+            ["Personal", "university", "bank", "dev1", "dev2", "dev3"])
 
     def test_slot_past_end_returns_none(self):
         self.assertIsNone(bc.container_for_slot(self.prefs, 7))
@@ -202,11 +209,12 @@ class BuildArgvTest(unittest.TestCase):
     # command-line URL allowlist (chrome/browser/ui/startup/url_util.cc
     # ValidateLaunchUrlWebUnsafe) rejects brave://newtab; about:blank is
     # allowed and was confirmed live to land as a container tab in the
-    # existing window.
+    # existing window. A web URL is also allowed and makes the tab useful
+    # immediately.
     EXE = "/opt/brave.com/brave-origin-beta/brave"
 
-    def test_new_tab_url_is_about_blank(self):
-        self.assertEqual(bc.NEW_TAB_URL, "about:blank")
+    def test_new_tab_url_is_google(self):
+        self.assertEqual(bc.NEW_TAB_URL, "https://www.google.com/")
 
     def test_container_switch_always_gets_a_url(self):
         self.assertEqual(bc.build_argv(self.EXE, [], "dev1"),
@@ -223,11 +231,6 @@ class BuildArgvTest(unittest.TestCase):
         result = bc.build_argv(self.EXE, [], "dev1", url="https://example.com")
         self.assertEqual(result,
                           [self.EXE, "--container=dev1", "https://example.com"])
-
-    def test_empty_string_url_is_honored_not_treated_as_unset(self):
-        result = bc.build_argv(self.EXE, [], "dev1", url="")
-        self.assertEqual(result, [self.EXE, "--container=dev1", ""])
-
 
 class LaunchPassthroughTest(unittest.TestCase):
     # A running instance's argv rarely names --user-data-dir explicitly --
@@ -374,6 +377,11 @@ class MainOpenArgWiringTest(unittest.TestCase):
         bc.main(["open", "4"])
         self.assertEqual(self.calls, [(4, False, None)])
 
+    def test_empty_url_is_rejected(self):
+        with self.assertRaises(SystemExit) as caught:
+            bc.main(["open", "4", "--url", ""])
+        self.assertEqual(caught.exception.code, 2)
+
 
 @unittest.skipUnless(os.environ.get("BRAVE_SHORTCUT_E2E") == "1",
                       "set BRAVE_SHORTCUT_E2E=1 to run against real Brave")
@@ -382,16 +390,22 @@ class EndToEndTest(unittest.TestCase):
     actually running/installed on this machine. Never launches Brave —
     --dry-run only."""
 
-    def test_open_dry_run_produces_plausible_argv(self):
+    def test_every_slot_dry_run_is_safe(self):
         target = bc.resolve_target()
         prefs, _ = bc.load_prefs(target)
-        container = bc.container_for_slot(prefs, 1)
-        self.assertIsNotNone(container, "slot 1 has no container configured")
-        passthrough = bc.launch_passthrough(target["exe"], target["argv"])
-        argv = bc.build_argv(target["exe"], passthrough, container["name"])
-        self.assertEqual(argv[0], target["exe"])
-        self.assertEqual(argv[-2], f"--container={container['name']}")
-        self.assertEqual(argv[-1], bc.NEW_TAB_URL)
+        for slot in range(1, 10):
+            container = bc.container_for_slot(prefs, slot)
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                self.assertEqual(bc.cmd_open(slot, dry_run=True), 0)
+            if container is None:
+                self.assertIn("no container configured", stderr.getvalue())
+                continue
+            argv = stdout.getvalue().strip().split()
+            self.assertEqual(argv[0], target["exe"])
+            self.assertTrue(any(arg.startswith("--user-data-dir=") for arg in argv))
+            self.assertEqual(argv[-2], f"--container={container['name']}")
+            self.assertEqual(argv[-1], bc.NEW_TAB_URL)
 
 
 if __name__ == "__main__":
