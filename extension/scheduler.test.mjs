@@ -594,6 +594,24 @@ test("only managed moves normalize, and unpinning a managed tab normalizes", asy
   assert.equal(chromeApi._calls.move.length, 2);
 });
 
+test("onUpdated ignores favicon, title, and audible changes", async () => {
+  // Every favicon/title/audible blip on every tab was re-running tabs.get +
+  // tabs.query + parseMarker for nothing -- only a url, load-status, or
+  // unpin change can possibly need a (re)sort.
+  const chromeApi = wireFake(fakeChrome([
+    { id: 1, windowId: 1, index: 0, url: "https://example.com/1" },
+  ]));
+  await drain(chromeApi);
+  const before = chromeApi._calls.query.length;
+
+  chromeApi._events.onUpdated.emit(1, { favIconUrl: "https://example.com/f.ico" }, { id: 1, windowId: 1 });
+  chromeApi._events.onUpdated.emit(1, { title: "New title" }, { id: 1, windowId: 1 });
+  chromeApi._events.onUpdated.emit(1, { audible: true }, { id: 1, windowId: 1 });
+  await drain(chromeApi);
+
+  assert.equal(chromeApi._calls.query.length, before, "no work should run for a non-navigational update");
+});
+
 test("close, replacement, and cross-window attachment maintain session records", async () => {
   const chromeApi = wireFake(fakeChrome([
     { id: 1, windowId: 1, index: 0, url: "https://example.com/1" },

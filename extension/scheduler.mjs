@@ -263,6 +263,10 @@ export function startScheduler(chromeApi) {
     track(enqueue(tab.windowId, () => processTab(tab.id, tab.windowId)));
   });
   tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+    // Every favicon/title/audible change on every tab otherwise re-runs
+    // tabs.get + tabs.query + parseMarker for nothing -- only a URL change,
+    // a load-status change, or an unpin can possibly need a (re)sort.
+    if (!changeInfo.url && !changeInfo.status && changeInfo.pinned !== false) return;
     track(enqueue(tab.windowId, () => processTab(tabId, tab.windowId, changeInfo.pinned === false)));
   });
   tabs.onMoved.addListener((tabId, moveInfo) => {
