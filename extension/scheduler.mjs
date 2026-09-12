@@ -1,5 +1,14 @@
 const MARKER_ORIGIN = "https://brave-container.invalid";
 const RECORD_PREFIX = "managed-tab:";
+const LOG_PREFIX = "[brave-container-scheduler]";
+
+// Self-healing catches (a tab closing mid-operation, a transient storage
+// failure) intentionally keep running rather than propagate -- the next
+// event or command repairs the state. Logging here doesn't change that
+// recovery behavior, it just stops the failure from being invisible.
+function logError(context, error) {
+  console.error(LOG_PREFIX, context, error);
+}
 
 function validTarget(value) {
   if (typeof value !== "string"
@@ -135,7 +144,7 @@ export function startScheduler(chromeApi) {
 
   const track = (promise) => {
     const tracked = Promise.resolve(promise)
-      .catch(() => {})
+      .catch((error) => logError("unhandled", error))
       .finally(() => pending.delete(tracked));
     pending.add(tracked);
     return tracked;
@@ -175,8 +184,9 @@ export function startScheduler(chromeApi) {
     for (const move of planMoves(windowTabs, records)) {
       try {
         await tabs.move(move.tabId, { index: move.index });
-      } catch {
+      } catch (error) {
         // A closed or temporarily immovable tab will be repaired by the next event/command.
+        logError("move", error);
       }
     }
   };
@@ -185,7 +195,8 @@ export function startScheduler(chromeApi) {
     let current;
     try {
       current = await tabs.get(tabId);
-    } catch {
+    } catch (error) {
+      logError("processTab:get", error);
       return;
     }
     if (current.windowId !== windowId) {
@@ -239,7 +250,8 @@ export function startScheduler(chromeApi) {
       let tab;
       try {
         tab = await tabs.get(addedTabId);
-      } catch {
+      } catch (error) {
+        logError("onReplaced:get", error);
         await Promise.allSettled([...queues.values()]);
         await session.remove(oldKey);
         return;

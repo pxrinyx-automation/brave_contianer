@@ -800,3 +800,49 @@ test("sequence exhaustion fails closed without updating the tab", async () => {
   assert.equal("managed-tab:1" in chromeApi._stored, false);
   assert.equal(chromeApi._calls.update.length, 0);
 });
+
+test("swallowed failures are still observable through structured logging", async () => {
+  const logs = [];
+  const originalError = console.error;
+  console.error = (...args) => logs.push(args);
+  try {
+    const chromeApi = wireFake(fakeChrome([
+      { id: 10, windowId: 1, index: 0, url: "https://example.com/existing" },
+      { id: 1, windowId: 1, index: 1, url: openMarker(1, "log-one") },
+    ]));
+    chromeApi._stored["managed-tab:10"] = record(2, 1);
+    chromeApi._failMoves.add(10); // tab 10 (slot 2) must shift for slot 1 -- this move fails.
+    chromeApi._events.onCreated.emit({ id: 1, windowId: 1 });
+    await drain(chromeApi);
+    assert.ok(logs.length > 0, "expected at least one structured log entry");
+    assert.ok(logs.every(([prefix]) => prefix === "[brave-container-scheduler]"),
+      "log entries should carry a stable, greppable prefix");
+  } finally {
+    console.error = originalError;
+  }
+});
+
+test("closing every tab in a window removes all of that window's managed-tab state", async () => {
+  const chromeApi = wireFake(fakeChrome([
+    { id: 1, windowId: 9, index: 0, url: openMarker(1, "w9-a") },
+    { id: 2, windowId: 9, index: 1, url: openMarker(2, "w9-b") },
+    { id: 3, windowId: 1, index: 0, url: openMarker(1, "w1-a") },
+  ]));
+  chromeApi._events.onCreated.emit({ id: 1, windowId: 9 });
+  chromeApi._events.onCreated.emit({ id: 2, windowId: 9 });
+  chromeApi._events.onCreated.emit({ id: 3, windowId: 1 });
+  await drain(chromeApi);
+  assert.ok(chromeApi._stored["managed-tab:1"]);
+  assert.ok(chromeApi._stored["managed-tab:2"]);
+
+  // Chrome fires tabs.onRemoved for every tab a closing window contained
+  // (removeInfo.isWindowClosing: true) before windows.onRemoved fires for
+  // the window itself, so per-tab cleanup already clears all of a closed
+  // window's state -- no separate windows.onRemoved handler is needed.
+  chromeApi._events.onRemoved.emit(1, { windowId: 9, isWindowClosing: true });
+  chromeApi._events.onRemoved.emit(2, { windowId: 9, isWindowClosing: true });
+  await drain(chromeApi);
+  assert.equal("managed-tab:1" in chromeApi._stored, false);
+  assert.equal("managed-tab:2" in chromeApi._stored, false);
+  assert.ok(chromeApi._stored["managed-tab:3"], "other windows must be untouched");
+});
