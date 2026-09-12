@@ -177,10 +177,19 @@ export function startScheduler(chromeApi) {
   };
 
   const normalize = async (windowId) => {
-    const [windowTabs, records] = await Promise.all([
-      tabs.query({ windowId, windowType: "normal" }),
-      session.get(null),
-    ]);
+    let windowTabs;
+    let records;
+    try {
+      [windowTabs, records] = await Promise.all([
+        tabs.query({ windowId, windowType: "normal" }),
+        session.get(null),
+      ]);
+    } catch (error) {
+      // Best-effort: a failed sort is repaired by the next event/command,
+      // and must never block the tab that triggered it from navigating.
+      logError("normalize:query", error);
+      return;
+    }
     for (const move of planMoves(windowTabs, records)) {
       try {
         await tabs.move(move.tabId, { index: move.index });
@@ -216,14 +225,17 @@ export function startScheduler(chromeApi) {
 
     const key = `${RECORD_PREFIX}${tabId}`;
     const existing = (await session.get(key))[key];
-    if (existing?.nonce !== marker.nonce || existing?.slot !== marker.slot
-      || !Number.isSafeInteger(existing?.sequence) || existing.sequence < 0) {
+    const isNew = existing?.nonce !== marker.nonce || existing?.slot !== marker.slot
+      || !Number.isSafeInteger(existing?.sequence) || existing.sequence < 0;
+    if (isNew) {
       await session.set({
         [key]: { slot: marker.slot, sequence: await allocateSequence(), nonce: marker.nonce },
       });
-      await normalize(windowId);
     }
+    // Navigation must never wait on the sort: a stranded marker tab (stuck on
+    // the brave-container.invalid error page) is worse than a brief mis-order.
     await tabs.update(tabId, { url: marker.target });
+    if (isNew) await normalize(windowId);
   };
 
   tabs.onCreated.addListener((tab) => {

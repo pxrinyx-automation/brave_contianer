@@ -734,6 +734,30 @@ test("missing tabs, failed storage, query, and update calls recover on later eve
   assert.equal(chromeApi._calls.update.filter(({ tabId }) => tabId === 4).length, 2);
 });
 
+test("a new marker tab still navigates to its target when normalize fails", async () => {
+  // Reported live bug: processTab awaited normalize(windowId) BEFORE
+  // tabs.update, so any rejection inside normalize (a failed tabs.query or
+  // session.get) left the tab stranded on the brave-container.invalid error
+  // page forever -- the marker was recorded but never consumed. Navigation
+  // must not depend on the sort succeeding.
+  const chromeApi = wireFake(fakeChrome([
+    { id: 1, windowId: 1, index: 0, url: openMarker(2, "first") },
+  ]));
+  chromeApi._events.onCreated.emit({ id: 1, windowId: 1 });
+  await drain(chromeApi); // primes allocateSequence's one-time session.get(null)
+
+  chromeApi._tabs.push({ id: 2, windowId: 1, index: 1, url: openMarker(1, "second") });
+  chromeApi._failGets.add("storage:all"); // normalize's session.get(null) now fails
+  chromeApi._events.onCreated.emit({ id: 2, windowId: 1 });
+  await drain(chromeApi);
+
+  assert.ok(
+    chromeApi._calls.update.some(({ tabId, url }) => tabId === 2 && url === "https://example.com/second"),
+    "tab must navigate to its target even though the sort failed",
+  );
+  assert.ok(chromeApi._stored["managed-tab:2"], "the marker must still be recorded");
+});
+
 test("invalid existing records are repaired and unpinning without a marker normalizes", async () => {
   const chromeApi = wireFake(fakeChrome([
     { id: 1, windowId: 1, index: 0, url: "https://example.com/one", pinned: false },
