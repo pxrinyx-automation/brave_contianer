@@ -193,24 +193,80 @@ class ProfileDirForTest(unittest.TestCase):
 
 
 class BuildArgvTest(unittest.TestCase):
-    # Step 0 probe (2026-09-12): bare `--container=<name>` opens a new tab
-    # in the running instance (renderer count 12 -> 13, "Opening in
-    # existing browser session"). No URL argument needed.
+    # Step 0 probe re-run (2026-09-12, corrected): a bare --container=<name>
+    # with no URL sets no HAS_CMD_LINE_TABS, so Chromium's forwarded-command
+    # -line path (startup_browser_creator_impl.cc DetermineBrowserOpenBehavior)
+    # falls through to BrowserOpenBehavior::NEW -- a new *window* -- and
+    # brave-core's container-tab attachment is skipped entirely for an empty
+    # tab list (brave_startup_tab_provider_impl.cc). A URL is required. The
+    # command-line URL allowlist (chrome/browser/ui/startup/url_util.cc
+    # ValidateLaunchUrlWebUnsafe) rejects brave://newtab; about:blank is
+    # allowed and was confirmed live to land as a container tab in the
+    # existing window.
     EXE = "/opt/brave.com/brave-origin-beta/brave"
 
-    def test_bare_container_switch_by_name(self):
+    def test_new_tab_url_is_about_blank(self):
+        self.assertEqual(bc.NEW_TAB_URL, "about:blank")
+
+    def test_container_switch_always_gets_a_url(self):
         self.assertEqual(bc.build_argv(self.EXE, [], "dev1"),
-                          [self.EXE, "--container=dev1"])
+                          [self.EXE, "--container=dev1", bc.NEW_TAB_URL])
 
     def test_passthrough_comes_before_container_switch(self):
         result = bc.build_argv(self.EXE, ["--user-data-dir=/x"], "dev1")
-        self.assertEqual(result,
-                          [self.EXE, "--user-data-dir=/x", "--container=dev1"])
+        self.assertEqual(
+            result,
+            [self.EXE, "--user-data-dir=/x", "--container=dev1",
+             bc.NEW_TAB_URL])
 
-    def test_explicit_url_appended_last(self):
-        result = bc.build_argv(self.EXE, [], "dev1", url="brave://newtab")
+    def test_explicit_url_overrides_default(self):
+        result = bc.build_argv(self.EXE, [], "dev1", url="https://example.com")
         self.assertEqual(result,
-                          [self.EXE, "--container=dev1", "brave://newtab"])
+                          [self.EXE, "--container=dev1", "https://example.com"])
+
+    def test_empty_string_url_is_honored_not_treated_as_unset(self):
+        result = bc.build_argv(self.EXE, [], "dev1", url="")
+        self.assertEqual(result, [self.EXE, "--container=dev1", ""])
+
+
+class LaunchPassthroughTest(unittest.TestCase):
+    # A running instance's argv rarely names --user-data-dir explicitly --
+    # Brave's channel wrappers select it via a CHROME_VERSION_EXTRA env var
+    # (confirmed: /usr/bin/brave-origin-beta sets CHROME_VERSION_EXTRA=beta),
+    # which a freshly Popen'd child does not inherit. Launching the exe
+    # directly with no --user-data-dir therefore falls back to Chromium's
+    # *stable* default profile -- a disconnected new instance/window, not the
+    # running one. So launch_passthrough always forces the value, using the
+    # same resolution load_prefs already relies on.
+    EXE = "/opt/brave.com/brave-origin-beta/brave"
+
+    def test_forces_user_data_dir_even_when_not_explicit(self):
+        result = bc.launch_passthrough(self.EXE, [self.EXE])
+        self.assertIn(
+            f"--user-data-dir={bc.user_data_dir_for(self.EXE, [self.EXE])}",
+            result)
+
+    def test_omits_profile_directory_when_default(self):
+        result = bc.launch_passthrough(self.EXE, [self.EXE])
+        self.assertEqual(len(result), 1)
+
+    def test_includes_profile_directory_when_not_default(self):
+        argv = [self.EXE, "--profile-directory=Profile 2"]
+        result = bc.launch_passthrough(self.EXE, argv)
+        self.assertEqual(result[-1], "--profile-directory=Profile 2")
+
+    def test_honors_explicit_user_data_dir_in_running_argv(self):
+        argv = [self.EXE, "--user-data-dir=/custom/path"]
+        result = bc.launch_passthrough(self.EXE, argv)
+        self.assertIn("--user-data-dir=/custom/path", result)
+
+    def test_both_forced_together_user_data_dir_then_profile(self):
+        argv = [self.EXE, "--user-data-dir=/custom/path",
+                "--profile-directory=Profile 2"]
+        result = bc.launch_passthrough(self.EXE, argv)
+        self.assertEqual(
+            result,
+            ["--user-data-dir=/custom/path", "--profile-directory=Profile 2"])
 
 
 class GsettingsPlanTest(unittest.TestCase):
@@ -298,6 +354,27 @@ class UnbindPlanTest(unittest.TestCase):
         self.assertIn(f"{self.BASE}/custom0/", list_cmd[4])
 
 
+class MainOpenArgWiringTest(unittest.TestCase):
+    """argparse -> cmd_open wiring for `open`, isolated from real Brave I/O
+    by stubbing cmd_open itself (cmd_open's own body is real-I/O and
+    covered by EndToEndTest)."""
+
+    def setUp(self):
+        self.calls = []
+        self._orig = bc.cmd_open
+        bc.cmd_open = lambda slot, dry_run, url=None: (
+            self.calls.append((slot, dry_run, url)), 0)[1]
+        self.addCleanup(setattr, bc, "cmd_open", self._orig)
+
+    def test_url_flag_is_parsed_and_forwarded(self):
+        bc.main(["open", "4", "--url", "https://example.com"])
+        self.assertEqual(self.calls, [(4, False, "https://example.com")])
+
+    def test_url_defaults_to_none_when_omitted(self):
+        bc.main(["open", "4"])
+        self.assertEqual(self.calls, [(4, False, None)])
+
+
 @unittest.skipUnless(os.environ.get("BRAVE_SHORTCUT_E2E") == "1",
                       "set BRAVE_SHORTCUT_E2E=1 to run against real Brave")
 class EndToEndTest(unittest.TestCase):
@@ -310,10 +387,11 @@ class EndToEndTest(unittest.TestCase):
         prefs, _ = bc.load_prefs(target)
         container = bc.container_for_slot(prefs, 1)
         self.assertIsNotNone(container, "slot 1 has no container configured")
-        passthrough = bc._passthrough_args(target["argv"])
+        passthrough = bc.launch_passthrough(target["exe"], target["argv"])
         argv = bc.build_argv(target["exe"], passthrough, container["name"])
         self.assertEqual(argv[0], target["exe"])
-        self.assertEqual(argv[-1], f"--container={container['name']}")
+        self.assertEqual(argv[-2], f"--container={container['name']}")
+        self.assertEqual(argv[-1], bc.NEW_TAB_URL)
 
 
 if __name__ == "__main__":

@@ -130,16 +130,24 @@ def profile_dir_for(argv):
     return _switch_value(argv, "profile-directory") or "Default"
 
 
+NEW_TAB_URL = "about:blank"
+"""The only allowlisted command-line URL close to a blank new tab.
+brave://newtab is rejected by Chromium's launch-URL filter
+(chrome/browser/ui/startup/url_util.cc ValidateLaunchUrlWebUnsafe accepts
+only web-safe schemes, file://, an approved settings page, and exactly
+about:blank) -- confirmed live on this machine."""
+
+
 def build_argv(exe, passthrough, name, url=None):
     """Build the argv to hand to Popen. `passthrough` carries
-    --user-data-dir / --profile-directory when the running instance had
-    them explicitly (see user_data_dir_for/profile_dir_for). No URL is
-    needed in normal use: a bare --container=<name> already opens a new
-    tab in the running instance (verified against this machine's Brave)."""
-    argv = [exe, *passthrough, f"--container={name}"]
-    if url is not None:
-        argv.append(url)
-    return argv
+    --user-data-dir / --profile-directory (see launch_passthrough). A URL
+    is always included: without one, Chromium's forwarded-command-line path
+    sets no HAS_CMD_LINE_TABS and opens a new *window*
+    (startup_browser_creator_impl.cc DetermineBrowserOpenBehavior), and
+    brave-core skips container attachment entirely for an empty tab list
+    (brave_startup_tab_provider_impl.cc) -- confirmed live on this machine."""
+    return [exe, *passthrough, f"--container={name}",
+            NEW_TAB_URL if url is None else url]
 
 
 def container_for_slot(prefs, n):
@@ -259,10 +267,21 @@ def resolve_target():
     return pick_target(_gather_running(), _list_installed_binaries())
 
 
-def _passthrough_args(argv):
-    return [a for a in argv[1:]
-            if a.startswith("--user-data-dir=")
-            or a.startswith("--profile-directory=")]
+def launch_passthrough(exe, argv):
+    """Args to force onto the launched command so it targets the exact
+    same profile as the detected instance. Always includes
+    --user-data-dir: Brave's channel wrappers select the profile dir via a
+    CHROME_VERSION_EXTRA env var (e.g. /usr/bin/brave-origin-beta sets
+    CHROME_VERSION_EXTRA=beta), not a command-line switch, and a freshly
+    Popen'd child does not inherit it -- launching the exe path directly
+    with no --user-data-dir falls back to Chromium's *stable* default
+    profile, a disconnected new instance (confirmed live on this
+    machine). --profile-directory is added only when not "Default"."""
+    passthrough = [f"--user-data-dir={user_data_dir_for(exe, argv)}"]
+    profile = profile_dir_for(argv)
+    if profile != "Default":
+        passthrough.append(f"--profile-directory={profile}")
+    return passthrough
 
 
 def load_prefs(target):
@@ -331,7 +350,7 @@ def _run_commands(commands, dry_run):
             subprocess.run(cmd, check=True)
 
 
-def cmd_open(slot, dry_run):
+def cmd_open(slot, dry_run, url=None):
     target = resolve_target()
     prefs, _ = load_prefs(target)
     container = container_for_slot(prefs, slot)
@@ -339,8 +358,8 @@ def cmd_open(slot, dry_run):
         print(f"slot {slot}: no container configured, nothing to do",
               file=sys.stderr)
         return 0
-    passthrough = _passthrough_args(target["argv"])
-    argv = build_argv(target["exe"], passthrough, container["name"])
+    passthrough = launch_passthrough(target["exe"], target["argv"])
+    argv = build_argv(target["exe"], passthrough, container["name"], url=url)
     if dry_run:
         print(" ".join(argv))
         return 0
@@ -421,6 +440,9 @@ def main(argv=None):
     p_open = sub.add_parser("open", help="open a new tab in slot N")
     p_open.add_argument("slot", type=int)
     p_open.add_argument("--dry-run", action="store_true")
+    p_open.add_argument("--url", default=None,
+                         help="override the new-tab URL (default: %s)"
+                         % NEW_TAB_URL)
 
     sub.add_parser("list", help="show slot -> container mapping")
     sub.add_parser("doctor", help="diagnose session/brave/keybinding state")
@@ -434,7 +456,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         if args.cmd == "open":
-            return cmd_open(args.slot, args.dry_run)
+            return cmd_open(args.slot, args.dry_run, url=args.url)
         if args.cmd == "list":
             return cmd_list()
         if args.cmd == "doctor":

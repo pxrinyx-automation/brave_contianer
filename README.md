@@ -22,7 +22,7 @@ browser patching.
 Ctrl+Shift+N  ->  GNOME custom keybinding  ->  brave_container.py open N
                                                  -> detect running/installed Brave
                                                  -> read Preferences, find Nth container
-                                                 -> brave --container=<name>
+                                                 -> brave --user-data-dir=<dir> --container=<name> about:blank
 ```
 
 Slot N = the **Nth entry** in Brave's own container list
@@ -31,12 +31,47 @@ containers there and the keys follow, matching brave-core#38435's
 "live ordinal lookup" design intent (avoids the stale-mapping bug
 Firefox Multi-Account Containers had when containers were reordered).
 
-## Step 0 probe (recorded 2026-09-12)
+## Postmortem: Ctrl+Shift+N opened a new window, not a tab (fixed 2026-09-12)
 
-Confirmed against this machine's running Brave Origin Beta:
-bare `--container=<name>` (no URL argument) opens a new tab page in the
-existing window — renderer process count went 12→13 on
-`brave-origin-beta --container=dev2`. So `build_argv()` never needs a URL.
+Two independent bugs, both in `build_argv`/`cmd_open`'s launched command
+line, both confirmed live and from Chromium/brave-core source:
+
+1. **No `--user-data-dir` forced.** Brave's channel wrappers
+   (`/usr/bin/brave-origin-beta`, etc.) pick the profile directory via a
+   `CHROME_VERSION_EXTRA` env var, not a switch — a freshly spawned child
+   doesn't inherit it. Launching the exe path directly with no
+   `--user-data-dir` silently fell back to Chromium's *stable* default
+   profile: a brand-new, disconnected browser instance (its own window,
+   its own singleton socket, no containers) — never even reaching the
+   real running instance. `launch_passthrough()` now always forces
+   `--user-data-dir` (and `--profile-directory` when not `Default`),
+   reusing the same resolution `load_prefs()` already relies on.
+2. **No URL in the command line.** Even with the profile fixed, a bare
+   `--container=<name>` sets no `HAS_CMD_LINE_TABS`
+   (`chrome/browser/ui/startup/startup_tab_provider.cc`), so Chromium's
+   forwarded-command-line path
+   (`startup_browser_creator_impl.cc::DetermineBrowserOpenBehavior`)
+   returns `BrowserOpenBehavior::NEW` — a new window — and brave-core
+   skips container attachment entirely for an empty tab list
+   (`brave_startup_tab_provider_impl.cc`): `--container` was a silent
+   no-op. `build_argv()` now always appends a URL.
+
+**Original Step 0 probe was invalid.** It measured renderer-process count
+(12→13) as a proxy for "new tab opened", but a new *window* also adds a
+renderer — the proxy couldn't distinguish the two, and said nothing about
+whether the container was applied. Lesson: verify the property you
+actually care about (visually confirm tab vs. window, and the container
+badge), not a correlate of it.
+
+**`brave://newtab` doesn't work as the URL.** Command-line URLs are
+filtered by `chrome/browser/ui/startup/url_util.cc`
+(`ValidateLaunchUrlWebUnsafe`): only web-safe schemes, `file://`, an
+approved settings page, and exactly `about:blank` are allowed;
+`chrome://`/`brave://` need headless mode + `--allow-chrome-scheme-url`,
+which brave-core doesn't patch around. So the new-tab-page target is
+unreachable through `--container`; `about:blank` is the closest working
+substitute (a real tab, in the right container, in the existing window).
+Use `open N --url <address>` to target something else instead.
 
 ## Install
 
@@ -53,7 +88,7 @@ Press `Ctrl+Shift+1` .. `Ctrl+Shift+9`.
 
 | Command | What it does |
 |---|---|
-| `open N [--dry-run]` | Open a new tab in slot N's container (or print the argv) |
+| `open N [--dry-run] [--url URL]` | Open a tab (default `about:blank`) in slot N's container (or print the argv) |
 | `list` | Show slot -> container name for the detected Brave |
 | `doctor` | Session type, detected Brave (pid/channel/user-data-dir), Wayland-native check, container list, keybinding conflicts |
 | `install [--dry-run]` | Bind `Ctrl+Shift+1-9` via GNOME's `custom-keybindings` gsettings |
