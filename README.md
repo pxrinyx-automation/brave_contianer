@@ -134,7 +134,12 @@ window or windows.
 
 `Ctrl+Shift+0` is an extension command, not a GNOME-global binding. While Brave
 is focused, it normalizes every normal Brave window independently. It never
-turns ordinary tabs into managed tabs.
+turns ordinary tabs into managed tabs -- if none of your open tabs were opened
+via `Ctrl+Shift+1..9`, there is nothing for it to sort, and it correctly does
+nothing. Its result badges the extension's toolbar icon with the number of
+managed tabs it found (`0` if none), self-clearing after 2 seconds -- if no
+badge appears at all, the command isn't reaching the extension (see
+Troubleshooting).
 
 ## Commands
 
@@ -167,10 +172,15 @@ instead.
 
 ## Known limits
 
-- **Session-only ordering state**: managed-tab records live in
-  `chrome.storage.session`. Browser restart, extension reload/update, or
-  disabling the extension clears them. Already-navigated tabs then become
-  ordinary tabs; only newly opened marker tabs are managed.
+- **Ordering state survives extension reload, not a browser restart**:
+  managed-tab records live in `chrome.storage.local`, keyed by tab id, so
+  reloading/updating the extension at `brave://extensions` keeps existing
+  tabs managed. A full browser restart assigns new tab ids, so those records
+  become orphaned; the extension prunes them on its next startup. Only tabs
+  opened by `Ctrl+Shift+1..9` are ever managed -- a tab open before the
+  extension was installed, or opened by any other means, is invisible to the
+  scheduler and `Ctrl+Shift+0` will never reorder it. Close and reopen it
+  with the numbered shortcut to bring it under management.
 - **Tab groups**: existing Brave/Chromium tab groups are unsupported. The
   scheduler orders tabs without preserving group membership or boundaries.
 - **Markers are not authenticated**: the nonce provides uniqueness, not
@@ -204,13 +214,25 @@ profile; `Preferences` is only ever read.
 
 ## Troubleshooting
 
-If a shortcut leaves a `brave-container.invalid` error page open, the launcher
-worked but the extension did not consume its marker. Check that `extension/`
-is loaded and enabled at `brave://extensions`; use **Reload** there after
-changing extension files. If Brave says “Manifest file is missing or
-unreadable,” select the `extension/` directory itself, not the repository root.
-Reloading or re-enabling the extension clears its session state, so reopen tabs
-with the numbered shortcuts if they must be managed again.
+If a shortcut leaves a `brave-container.invalid` error page open **permanently**
+(a brief flash of it while DNS fails is expected and harmless -- the tab is
+navigated away from it immediately after), the extension did not consume its
+marker at all. Check, in order:
+
+1. `brave://extensions` -- is **Brave Container Tab Scheduler** listed,
+   enabled, and free of a red **Errors** button? Click **service worker** to
+   open its console; a failure to load there means nothing in this project
+   runs.
+2. `brave://extensions/shortcuts` -- does **Normalize shortcut-managed tabs
+   in every window** show `Ctrl+Shift+0`? GNOME owns `Ctrl+Shift+1-9`
+   globally; this one binding is Brave's own and can go unassigned.
+3. `./brave_container.py open 1 --dry-run` -- does the last argv element
+   start with `https://brave-container.invalid/#v=1&action=open&slot=1&`?
+   If not, the launcher itself is misconfigured, independent of the
+   extension.
+
+If Brave says "Manifest file is missing or unreadable," select the
+`extension/` directory itself, not the repository root.
 
 If a `file:` target stays on the marker page or fails to open, enable **Allow
 access to file URLs** in the extension's **Details**, then reopen it with the
