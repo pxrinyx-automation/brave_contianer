@@ -294,6 +294,21 @@ test("planMoves moves only managed tabs around manual interleaving", () => {
   assert.ok(moves.every(({ tabId }) => tabId !== 99));
 });
 
+test("planMoves ignores a manual tab even when its id, url, or title looks managed", () => {
+  // planMoves never reads tab.url or tab.title -- only tab.id/index/pinned
+  // plus the records dict -- so a manual tab that merely resembles a
+  // managed one (spec §16: "similar URLs", "similar titles") cannot be
+  // misclassified. The record, not the tab's content, is what's authoritative.
+  const tabs = [
+    { id: 5, index: 0, pinned: false, url: openMarker(3, "not-actually-registered"), title: "Slot 3" },
+    tab(2, 1),
+    tab(1, 2),
+  ];
+  const moves = planMoves(tabs, records({ 1: record(1, 1), 2: record(2, 2) }));
+  assert.deepEqual(moves, [{ tabId: 2, index: 2 }]);
+  assert.ok(moves.every(({ tabId }) => tabId !== 5), "tab 5 has no record and must never be moved");
+});
+
 test("planMoves keeps later destinations correct across multiple moves and a manual tab", () => {
   const tabs = [tab(1, 0), tab(4, 1), tab(3, 2), tab(99, 3), tab(2, 4)];
   const moves = planMoves(tabs, records({
