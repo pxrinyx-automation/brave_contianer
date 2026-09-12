@@ -135,7 +135,7 @@ export function planMoves(tabs, records) {
 }
 
 export function startScheduler(chromeApi) {
-  const { tabs, storage: { session }, commands } = chromeApi;
+  const { tabs, storage: { session }, commands, action } = chromeApi;
   const queues = new Map();
   const pending = new Set();
   const detachedWindows = new Map();
@@ -198,6 +198,27 @@ export function startScheduler(chromeApi) {
         logError("move", error);
       }
     }
+  };
+
+  // Ctrl+Shift+0 otherwise gives no feedback: "command never fired",
+  // "extension not running", and "fired, nothing to sort" all look
+  // identical. The badge distinguishes them; it self-clears so it never
+  // looks like a permanent extension error count.
+  const reportManagedCount = async () => {
+    if (!action) return;
+    const [allTabs, records] = await Promise.all([
+      tabs.query({ windowType: "normal" }),
+      session.get(null),
+    ]);
+    const count = allTabs.filter((tab) => {
+      const value = records[`${RECORD_PREFIX}${tab.id}`];
+      return !tab.pinned && Number.isInteger(value?.slot) && value.slot >= 1 && value.slot <= 9;
+    }).length;
+    await action.setBadgeText({ text: String(count) });
+    // unref: a plain browser setTimeout handle has no .unref, so this is a
+    // no-op there; under node:test it stops the dangling timer from holding
+    // the process open for the full 2s per test.
+    setTimeout(() => action.setBadgeText({ text: "" }), 2000).unref?.();
   };
 
   const processTab = async (tabId, windowId, normalizeUnpinned = false) => {
@@ -304,6 +325,7 @@ export function startScheduler(chromeApi) {
       const allTabs = await tabs.query({ windowType: "normal" });
       await Promise.all([...new Set(allTabs.map((tab) => tab.windowId))]
         .map((windowId) => enqueue(windowId, () => normalize(windowId))));
+      await reportManagedCount();
     })());
   });
 

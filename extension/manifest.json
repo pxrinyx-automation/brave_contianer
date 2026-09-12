@@ -5,6 +5,9 @@
   "description": "Keeps shortcut-opened Brave container tabs in stable slot order.",
   "permissions": ["tabs", "storage"],
   "host_permissions": ["file:///*"],
+  "action": {
+    "default_title": "Brave Container Tab Scheduler (badge = managed tabs sorted by Ctrl+Shift+0)"
+  },
   "background": {
     "service_worker": "background.js",
     "type": "module"

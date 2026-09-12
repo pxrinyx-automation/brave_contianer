@@ -35,7 +35,7 @@ class FakeEvent {
 function fakeChrome(initialTabs = []) {
   const tabState = initialTabs.map((item) => ({ pinned: false, ...item }));
   const stored = {};
-  const calls = { move: [], update: [], query: [] };
+  const calls = { move: [], update: [], query: [], badge: [] };
   const queryGates = new Map();
   const events = {
     onCreated: new FakeEvent(),
@@ -135,6 +135,11 @@ function fakeChrome(initialTabs = []) {
       },
     },
     commands: { onCommand: new FakeEvent() },
+    action: {
+      async setBadgeText(details) {
+        calls.badge.push(details);
+      },
+    },
   };
   return api;
 }
@@ -634,6 +639,31 @@ test("sort-all-managed normalizes every normal window", async () => {
   assert.deepEqual(chromeApi._tabs.filter(({ windowId }) => windowId === 2).map(({ id }) => id), [3, 4]);
   assert.deepEqual(chromeApi._tabs.filter(({ windowId }) => windowId === 3).map(({ id }) => id), [6, 5]);
   assert.ok(chromeApi._calls.query.some(({ windowType }) => windowType === "normal"));
+});
+
+test("sort-all-managed reports the managed tab count on the toolbar badge", async () => {
+  // Otherwise Ctrl+Shift+0 gives no feedback at all -- "command never fired",
+  // "extension isn't running", and "fired, found nothing to sort" all look
+  // identical to the user. The badge distinguishes them.
+  const chromeApi = wireFake(fakeChrome([
+    { id: 1, windowId: 1, index: 0, url: "https://example.com/1" },
+    { id: 2, windowId: 1, index: 1, url: "https://example.com/2" },
+  ]));
+  Object.assign(chromeApi._stored, records({ 1: record(1, 1), 2: record(2, 2) }));
+
+  chromeApi.commands.onCommand.emit("sort-all-managed");
+  await drain(chromeApi);
+
+  assert.deepEqual(chromeApi._calls.badge.at(0), { text: "2" });
+});
+
+test("sort-all-managed badges zero when nothing is managed", async () => {
+  const chromeApi = wireFake(fakeChrome([
+    { id: 1, windowId: 1, index: 0, url: "https://example.com/1" },
+  ]));
+  chromeApi.commands.onCommand.emit("sort-all-managed");
+  await drain(chromeApi);
+  assert.deepEqual(chromeApi._calls.badge.at(0), { text: "0" });
 });
 
 test("created tabs use pendingUrl before the current URL", async () => {
