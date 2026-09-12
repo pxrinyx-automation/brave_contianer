@@ -1,8 +1,9 @@
 # brave_shortcut
 
 Open a new Brave tab in container slot N with `Ctrl+Shift+N` (N = 1-9),
-on Linux with GNOME + native Wayland. All Brave channels (Stable, Beta,
-Nightly, Origin variants) — no hardcoded binary path.
+then keep shortcut-managed tabs in stable slot order. This targets Linux with
+GNOME + native Wayland and supports Brave Stable, Beta, Nightly, and Origin
+variants without a hardcoded binary path.
 
 ## How it works
 
@@ -16,14 +17,28 @@ by **name**, not id: names aren't guaranteed unique, but ids are reserved
 for temporary containers). Chromium's process singleton forwards that
 switch to the already-running instance for the target profile, so a new
 tab opens in the live window — no synthetic input, no XWayland, no
-browser patching.
+browser patching. An unpacked MV3 extension handles only the live tab-strip
+ordering that the launcher cannot control.
 
 ```
 Ctrl+Shift+N  ->  GNOME custom keybinding  ->  brave_container.py open N
                                                  -> detect running/installed Brave
                                                  -> read Preferences, find Nth container
-                                                 -> brave --user-data-dir=<dir> --container=<name> https://www.google.com/
+                                                 -> validate final target
+                                                 -> brave --user-data-dir=<dir> --container=<name> marker-URL
+
+marker tab    ->  extension sees created/updated tab and re-reads it
+              ->  store slot/sequence/nonce in storage.session
+              ->  normalize managed tabs in that Brave window
+              ->  navigate the same tab to the final target
 ```
+
+The marker is an internal handoff URL of the form
+`https://brave-container.invalid/#v=1&action=open&slot=N&target=...&nonce=...`.
+The Python launcher still resolves the profile and container. The extension
+validates the marker, assigns its session sequence, moves the tab, and finally
+opens Google or the `--url` override. If a move temporarily fails, it still
+opens the target and retains the record for the next normalization.
 
 Slot N = the **Nth entry** in Brave's own container list
 (`brave://settings/braveContent`), read live every time — reorder
@@ -77,24 +92,63 @@ removed.
 
 ## Install
 
+Install the extension before the GNOME bindings; otherwise a shortcut opens a
+marker error page instead of its final target.
+
+1. Open `brave://extensions`, enable **Developer mode**, and choose **Load
+   unpacked**.
+2. Select this repository's `extension/` directory (the directory containing
+   `manifest.json`).
+3. If you will use `file:` targets, open the extension's **Details** and enable
+   **Allow access to file URLs**.
+4. Open `brave://extensions/shortcuts` and verify **Brave Container Tab
+   Scheduler** has `Ctrl+Shift+0` assigned to **Normalize shortcut-managed tabs
+   in every window**. Assign it there if Brave reports a conflict.
+5. Test and install the GNOME bindings:
+
 ```bash
-python3 -m unittest test_brave_container   # run the test suite first
-./brave_container.py doctor                # sanity-check your system
-./brave_container.py install --dry-run     # review the gsettings commands
-./brave_container.py install               # apply
+python3 -m unittest test_brave_container
+node --test extension/scheduler.test.mjs
+./brave_container.py doctor
+./brave_container.py install --dry-run
+./brave_container.py install
 ```
 
 Press `Ctrl+Shift+1` .. `Ctrl+Shift+9`.
+
+## Tab ordering
+
+Tabs carrying a valid marker are managed; normally those tabs are created by
+the numbered shortcuts. Among unpinned managed tabs in a window, the invariant
+is ascending `(slot, sequence)`, where `sequence` is the order in which the
+extension processes new markers. Thus opening slots `1 2 3`, then another slot
+`1`, produces managed order `1 1 2 3`; repeated tabs in one slot retain their
+original order.
+
+Manual tabs are never passed to `tabs.move()` and may remain between managed
+tabs. Pinned tabs are excluded; unpinning a managed tab triggers normalization.
+Dragging a managed tab triggers normalization back to the invariant, while
+dragging an unmanaged tab does not trigger a sort. Close, replacement, and
+cross-window attachment update the session record and normalize the affected
+window or windows.
+
+`Ctrl+Shift+0` is an extension command, not a GNOME-global binding. While Brave
+is focused, it normalizes every normal Brave window independently. It never
+turns ordinary tabs into managed tabs.
 
 ## Commands
 
 | Command | What it does |
 |---|---|
-| `open N [--dry-run] [--url URL]` | Open a tab (default `https://www.google.com/`) in slot N's container (or print the argv) |
+| `open N [--dry-run] [--url URL]` | Open a managed tab (default `https://www.google.com/`) in slot N's container, or print the marker-launch argv |
 | `list` | Show slot -> container name for the detected Brave |
 | `doctor` | Session type, detected Brave (pid/channel/user-data-dir), Wayland-native check, container list, keybinding conflicts |
 | `install [--dry-run]` | Bind `Ctrl+Shift+1-9` via GNOME's `custom-keybindings` gsettings |
 | `uninstall [--dry-run]` | Remove only this script's bindings |
+
+Accepted final targets use `http:`, `https:`, or `file:`, or are exactly
+`about:blank`. Empty, malformed, privileged-scheme, and recursive marker URLs
+are rejected before Brave is launched.
 
 ## Channel detection
 
@@ -113,6 +167,16 @@ instead.
 
 ## Known limits
 
+- **Session-only ordering state**: managed-tab records live in
+  `chrome.storage.session`. Browser restart, extension reload/update, or
+  disabling the extension clears them. Already-navigated tabs then become
+  ordinary tabs; only newly opened marker tabs are managed.
+- **Tab groups**: existing Brave/Chromium tab groups are unsupported. The
+  scheduler orders tabs without preserving group membership or boundaries.
+- **Markers are not authenticated**: the nonce provides uniqueness, not
+  authorization. Any page that deliberately navigates its own tab to a
+  syntactically valid marker can enroll and reorder that tab. This is the
+  tradeoff for coordinating the launcher and extension without a native bridge.
 - **Key conflicts**: `Ctrl+Shift+1-9` is grabbed globally once installed
   — any other app relying on those chords (some terminals' tab
   switching) stops receiving them while GNOME owns the binding. `doctor`
@@ -138,6 +202,20 @@ instead.
 Or delete this directory — nothing here ever writes to Brave's own
 profile; `Preferences` is only ever read.
 
+## Troubleshooting
+
+If a shortcut leaves a `brave-container.invalid` error page open, the launcher
+worked but the extension did not consume its marker. Check that `extension/`
+is loaded and enabled at `brave://extensions`; use **Reload** there after
+changing extension files. If Brave says “Manifest file is missing or
+unreadable,” select the `extension/` directory itself, not the repository root.
+Reloading or re-enabling the extension clears its session state, so reopen tabs
+with the numbered shortcuts if they must be managed again.
+
+If a `file:` target stays on the marker page or fails to open, enable **Allow
+access to file URLs** in the extension's **Details**, then reopen it with the
+numbered shortcut.
+
 ## If Brave ships native container shortcuts later
 
 Check `brave://accelerators` / `brave://settings/system/shortcuts` for
@@ -149,11 +227,13 @@ uninstall` first so the two don't both claim `Ctrl+Shift+N`.
 ## Tests
 
 ```bash
-python3 -m unittest -v test_brave_container            # pure-function unit tests
+python3 -m unittest -v test_brave_container
+node --test extension/scheduler.test.mjs
 BRAVE_SHORTCUT_E2E=1 python3 -m unittest -v test_brave_container.EndToEndTest
 ```
-The E2E test is opt-in and read/dry-run only — it never launches Brave. It
-covers slots 1-9; unconfigured slots safely do nothing.
+The Python E2E test is opt-in and read/dry-run only — it never launches Brave.
+It covers slots 1-9; unconfigured slots safely do nothing. The Node suite uses
+the built-in test runner and a fake Chrome API; it installs no dependencies.
 
 For a final live check, start Brave first, record its browser PID, then run
 `./brave_container.py open 1`. Confirm the original PID is still the only

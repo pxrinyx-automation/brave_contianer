@@ -1,8 +1,15 @@
 """Tests for brave_container.py — stdlib unittest, no external deps."""
+import argparse
+import ast
 import contextlib
 import io
+import json
 import os
+import subprocess
+from types import SimpleNamespace
 import unittest
+from unittest import mock
+from urllib.parse import parse_qs, urlsplit
 
 import brave_container as bc
 
@@ -52,6 +59,38 @@ class ContainerForSlotTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             bc.container_for_slot(self.prefs, 10)
 
+    def test_slot_boundaries_and_types(self):
+        self.assertEqual(bc.container_for_slot(self.prefs, 9), None)
+        for slot in ("1", 1.0, True, None):
+            with self.subTest(slot=slot):
+                with self.assertRaises(TypeError):
+                    bc.container_for_slot(self.prefs, slot)
+
+    def test_schema_and_record_corruption_is_unavailable(self):
+        malformed = (
+            None, {}, {"brave": None}, {"brave": {"containers": {}}},
+            {"brave": {"containers": {"list": None}}},
+            {"brave": {"containers": {"list": "not-a-list"}}},
+            {"brave": {"containers": {"list": [None]}}},
+            {"brave": {"containers": {"list": [{}]}}},
+            {"brave": {"containers": {"list": [{"id": 1, "name": "x"}]}}},
+            {"brave": {"containers": {"list": [{"id": "x", "name": 1}]}}},
+            {"brave": {"containers": {"list": [{"id": "", "name": "x"}]}}},
+            {"brave": {"containers": {"list": [{"id": "x", "name": ""}]}}},
+            {"brave": {"containers": {"list": [
+                {"id": "x\x00", "name": "x"}]} }},
+        )
+        for prefs in malformed:
+            with self.subTest(prefs=prefs):
+                self.assertIsNone(bc.container_for_slot(prefs, 1))
+
+    def test_names_are_returned_without_shell_interpretation(self):
+        prefs = {"brave": {"containers": {"list": [
+            {"id": "id", "name": "名字;$(touch /tmp/pwned)"},
+        ]}}}
+        self.assertEqual(bc.container_for_slot(prefs, 1),
+                         {"id": "id", "name": "名字;$(touch /tmp/pwned)"})
+
 
 class ParsePsTest(unittest.TestCase):
     # Shape captured from `pgrep -af brave` on this machine: a bash-exec'd
@@ -88,6 +127,26 @@ class ParsePsTest(unittest.TestCase):
     def test_blank_lines_ignored(self):
         text = "\n" + self.PS_TEXT + "\n\n"
         self.assertEqual(len(bc.parse_ps(text)), 1)
+
+    def test_garbage_pid_rows_non_positive_and_fake_executables_are_ignored(self):
+        text = "\n".join([
+            "garbage /usr/bin/brave",
+            "0 /usr/bin/brave",
+            "-1 /usr/bin/brave",
+            "12",
+            "13\t/usr/bin/brave-browser-beta --flag",
+            "14 /opt/brave/brave-not-real",
+            "15 /opt/brave/brave-browser-nightly --flag",
+            "16 /opt/brave/brave-origin-stable --flag",
+            "17 /opt/例え/brave --flag",
+            "18 /opt/brave/chrome_crashpad_handler",
+            "19 /opt/brave/brave --type=renderer",
+        ])
+        result = bc.parse_ps(text)
+        self.assertEqual([item["pid"] for item in result], [13, 15, 16, 17])
+
+    def test_non_string_process_output_is_fail_closed(self):
+        self.assertEqual(bc.parse_ps(None), [])
 
 
 class ChannelOfTest(unittest.TestCase):
@@ -232,6 +291,134 @@ class BuildArgvTest(unittest.TestCase):
         self.assertEqual(result,
                           [self.EXE, "--container=dev1", "https://example.com"])
 
+
+class SortMarkerTest(unittest.TestCase):
+    def test_fields_and_target_are_encoded_in_fragment(self):
+        marker = bc.build_sort_marker(
+            4, "https://example.com/a%20path?q=x&y=two#end", "nonce_123")
+        parsed = urlsplit(marker)
+        self.assertEqual((parsed.scheme, parsed.netloc, parsed.path),
+                         ("https", "brave-container.invalid", "/"))
+        self.assertEqual(parse_qs(parsed.fragment), {
+            "v": ["1"],
+            "action": ["open"],
+            "slot": ["4"],
+            "target": ["https://example.com/a%20path?q=x&y=two#end"],
+            "nonce": ["nonce_123"],
+        })
+
+    def test_nonce_and_slot_validation(self):
+        for nonce in ("", "a b", "a/b", "a;b", "é", None, 1):
+            with self.subTest(nonce=nonce):
+                with self.assertRaises(ValueError):
+                    bc.build_sort_marker(1, "https://example.com/", nonce)
+        for slot in (0, 10):
+            with self.assertRaises(ValueError):
+                bc.build_sort_marker(slot, "https://example.com/", "n")
+
+
+class TargetUrlValidationTest(unittest.TestCase):
+    def test_allowed_targets_are_returned_unchanged(self):
+        for target in (
+                "http://example.com/path", "https://example.com/",
+                "https://192.168.1.1/", "file:///tmp/report.html",
+                "https://user:pass@example.com:8443/path",
+                "https://例え.テスト/",
+                "https://[2001:db8::1]/",
+                "http://127.0.0.1:8080/a?x=1&y=2#part",
+                "https://[::1]:8443/#fragment",
+                "http://localhost/",
+                "about:blank"):
+            with self.subTest(target=target):
+                self.assertEqual(bc.target_url(target), target)
+
+    def test_invalid_or_privileged_targets_are_rejected(self):
+        for target in (
+                "", "example.com", "https://", "https://example.com:bad",
+                "file:", "about:settings",
+                "brave://settings", "chrome://settings",
+                "javascript:alert(1)",
+                "https://brave-container.invalid\\@example.com/",
+                "https://brave-container.invalid./",
+                "https://brave-container%2Einvalid/",
+                "https://%62rave-container.invalid/",
+                "https://example%2F.com/",
+                "https://999.999.999.999/",
+                "https://4294967296/",
+                "https://0x100000000/",
+                "https://0300.0250.0001.0001/",
+                "https://127.1/",
+                "https://[v1.fe]/",
+                "https://[example.com]/",
+                "https://brave-container\u3002invalid/",
+                "https://brave-container\uff0einvalid/",
+                "https://brave-container\uff61invalid/",
+                "\x00https://example.com/",
+                "https://exa\x00mple.com/",
+                "https://brave-container.invalid/#v=1&action=open"):
+            with self.subTest(target=target):
+                with self.assertRaises(argparse.ArgumentTypeError):
+                    bc.target_url(target)
+
+    def test_non_strings_encoded_controls_and_shell_inputs_are_rejected(self):
+        for target in (None, 1, b"https://example.com", "https://example.com/%00",
+                       "https://example.com/$(id)", "https://example.com/a;b",
+                       "https://example.com/a|b", "--no-sandbox"):
+            with self.subTest(target=target):
+                with self.assertRaises(argparse.ArgumentTypeError):
+                    bc.target_url(target)
+
+
+class CmdOpenTest(unittest.TestCase):
+    TARGET = {
+        "exe": "/opt/brave/brave",
+        "argv": ["/opt/brave/brave"],
+        "running": True,
+        "pid": 12,
+    }
+    PREFS = {"brave": {"containers": {"list": [
+        {"id": "id-1", "name": "Personal"},
+    ]}}}
+
+    def setUp(self):
+        patches = (
+            mock.patch.object(bc, "resolve_target", return_value=self.TARGET),
+            mock.patch.object(bc, "load_prefs",
+                              return_value=(self.PREFS, "/tmp/Preferences")),
+            mock.patch.object(bc, "launch_passthrough",
+                              return_value=["--user-data-dir=/profile"]),
+            mock.patch.object(bc.secrets, "token_urlsafe",
+                              return_value="fixed-nonce"),
+        )
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def test_default_target_is_wrapped_in_marker_for_dry_run(self):
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            self.assertEqual(bc.cmd_open(1, dry_run=True), 0)
+        marker = stdout.getvalue().strip().split()[-1]
+        fields = parse_qs(urlsplit(marker).fragment)
+        self.assertEqual(fields["slot"], ["1"])
+        self.assertEqual(fields["target"], [bc.NEW_TAB_URL])
+        self.assertEqual(fields["nonce"], ["fixed-nonce"])
+
+    def test_override_target_is_wrapped_in_marker(self):
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            bc.cmd_open(1, dry_run=True, url="https://example.com/a?q=1&x=2")
+        marker = stdout.getvalue().strip().split()[-1]
+        self.assertEqual(parse_qs(urlsplit(marker).fragment)["target"],
+                         ["https://example.com/a?q=1&x=2"])
+
+    def test_unconfigured_slot_remains_a_no_op_without_nonce(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.assertEqual(bc.cmd_open(7, dry_run=True), 0)
+        self.assertIn("no container configured", stderr.getvalue())
+        bc.secrets.token_urlsafe.assert_not_called()
+
 class LaunchPassthroughTest(unittest.TestCase):
     # A running instance's argv rarely names --user-data-dir explicitly --
     # Brave's channel wrappers select it via a CHROME_VERSION_EXTRA env var
@@ -356,6 +543,236 @@ class UnbindPlanTest(unittest.TestCase):
                          if c[3] == "custom-keybindings")
         self.assertIn(f"{self.BASE}/custom0/", list_cmd[4])
 
+    def test_similarly_named_entries_are_foreign(self):
+        existing = [
+            {"path": f"{self.BASE}/custom1/", "name": "brave-container-10",
+             "binding": "x", "command": "foreign"},
+            {"path": f"{self.BASE}/custom2/", "name": "brave-container-x",
+             "binding": "x", "command": "foreign"},
+            {"path": f"{self.BASE}/custom3/", "name": "brave-container-1-extra",
+             "binding": "x", "command": "foreign"},
+            {"path": f"{self.BASE}/custom4/", "name": "brave-container-1",
+             "binding": "x", "command": "ours"},
+        ]
+        paths = ast.literal_eval(bc.unbind_plan(existing)["commands"][0][4])
+        self.assertEqual(paths, [f"{self.BASE}/custom1/",
+                                 f"{self.BASE}/custom2/",
+                                 f"{self.BASE}/custom3/"])
+
+
+class IoShellTest(unittest.TestCase):
+    TARGET = {"exe": "/opt/brave/brave", "argv": ["/opt/brave/brave"],
+              "pid": 12, "running": True}
+
+    def test_installed_binary_discovery_filters_and_deduplicates(self):
+        by_pattern = {
+            bc._BINARY_GLOBS[0]: ["/usr/bin/brave-browser", "/usr/bin/brave-beta"],
+            bc._BINARY_GLOBS[1]: ["/usr/bin/brave-origin", "/usr/bin/brave-link"],
+        }
+        with mock.patch.object(bc.glob, "glob", side_effect=lambda pattern: by_pattern[pattern]), \
+                mock.patch.object(bc.os, "access", side_effect=lambda path, mode: path != "/usr/bin/brave-beta"), \
+                mock.patch.object(bc.os.path, "realpath", side_effect=lambda path: "/usr/bin/brave-origin" if "link" in path else path):
+            self.assertEqual(bc._list_installed_binaries(),
+                             ["/usr/bin/brave-browser", "/usr/bin/brave-origin"])
+
+    def test_gather_running_uses_ps_and_parser(self):
+        completed = SimpleNamespace(stdout="12 /usr/bin/brave-browser\n")
+        with mock.patch.object(bc.subprocess, "run", return_value=completed) as run:
+            self.assertEqual(bc._gather_running(), [{
+                "pid": 12, "exe": "/usr/bin/brave-browser",
+                "argv": ["/usr/bin/brave-browser"],
+            }])
+        run.assert_called_once_with(["ps", "-eo", "pid=,args="],
+                                    capture_output=True, text=True, check=True)
+
+    def test_load_prefs_wraps_os_json_and_encoding_failures(self):
+        with mock.patch("builtins.open", side_effect=OSError("missing")):
+            with self.assertRaises(bc.PreferencesUnreadableError):
+                bc.load_prefs(self.TARGET)
+        for failure in (OSError("missing"), json.JSONDecodeError("bad", "{", 0),
+                        UnicodeDecodeError("utf-8", b"\xff", 0, 1, "bad")):
+            with self.subTest(failure=type(failure).__name__), \
+                    mock.patch("builtins.open", mock.mock_open()), \
+                    mock.patch.object(bc.json, "load", side_effect=failure):
+                with self.assertRaises(bc.PreferencesUnreadableError):
+                    bc.load_prefs(self.TARGET)
+
+    def test_load_prefs_returns_data_and_exact_path(self):
+        handle = mock.mock_open()
+        with mock.patch("builtins.open", handle), \
+                mock.patch.object(bc.json, "load", return_value={"ok": True}):
+            prefs, path = bc.load_prefs({
+                "exe": "/opt/brave.com/brave-origin-beta/brave",
+                "argv": ["/opt/brave.com/brave-origin-beta/brave",
+                         "--profile-directory=Profile 2"],
+            })
+        self.assertEqual(prefs, {"ok": True})
+        self.assertTrue(path.endswith("/Brave-Origin-Beta/Profile 2/Preferences"))
+        handle.assert_called_once_with(path, encoding="utf-8")
+
+    def test_wayland_probe_is_best_effort(self):
+        with mock.patch.object(bc.os, "listdir", side_effect=OSError):
+            self.assertIsNone(bc._wayland_native(12))
+        with mock.patch.object(bc.os, "listdir", return_value=["0", "1"]), \
+                mock.patch.object(bc.os, "readlink", side_effect=[OSError, "socket:[wayland-0]"]):
+            self.assertTrue(bc._wayland_native(12))
+        with mock.patch.object(bc.os, "listdir", return_value=["0"]), \
+                mock.patch.object(bc.os, "readlink", side_effect=OSError):
+            self.assertFalse(bc._wayland_native(12))
+
+    def test_gsettings_reads_and_parses_gvariant_values(self):
+        values = {
+            (bc._MEDIA_KEYS_SCHEMA, "custom-keybindings"): "@as ['/p/one/', '/p/two/']",
+            (f"{bc._CUSTOM_KEYBINDING_SCHEMA}:/p/one/", "name"): "'one'",
+            (f"{bc._CUSTOM_KEYBINDING_SCHEMA}:/p/one/", "binding"): "'<Super>1'",
+            (f"{bc._CUSTOM_KEYBINDING_SCHEMA}:/p/one/", "command"): "'/bin/one'",
+            (f"{bc._CUSTOM_KEYBINDING_SCHEMA}:/p/two/", "name"): "'two'",
+            (f"{bc._CUSTOM_KEYBINDING_SCHEMA}:/p/two/", "binding"): "'<Super>2'",
+            (f"{bc._CUSTOM_KEYBINDING_SCHEMA}:/p/two/", "command"): "'/bin/two'",
+        }
+        with mock.patch.object(bc, "_gsettings_get",
+                               side_effect=lambda schema, key: values[(schema, key)]):
+            self.assertEqual(bc._existing_custom_keybindings(), [
+                {"path": "/p/one/", "name": "one", "binding": "<Super>1",
+                 "command": "/bin/one"},
+                {"path": "/p/two/", "name": "two", "binding": "<Super>2",
+                 "command": "/bin/two"},
+            ])
+
+    def test_gsettings_malformed_list_is_rejected(self):
+        with mock.patch.object(bc, "_gsettings_get", return_value="not a list"):
+            with self.assertRaises(ValueError):
+                bc._existing_custom_keybindings()
+
+    def test_gsettings_get_and_run_commands(self):
+        completed = SimpleNamespace(stdout="'value'\n")
+        with mock.patch.object(bc.subprocess, "run", return_value=completed) as run:
+            self.assertEqual(bc._gsettings_get("schema", "key"), "'value'")
+        run.assert_called_once_with(["gsettings", "get", "schema", "key"],
+                                    capture_output=True, text=True, check=True)
+        commands = [["gsettings", "set", "schema", "key", "value"]]
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout), \
+                mock.patch.object(bc.subprocess, "run") as run:
+            bc._run_commands(commands, dry_run=True)
+            bc._run_commands(commands, dry_run=False)
+        self.assertEqual(stdout.getvalue(), "gsettings set schema key value\n")
+        run.assert_called_once_with(commands[0], check=True)
+
+
+class CommandShellTest(unittest.TestCase):
+    PREFS = {"brave": {"containers": {"list": [
+        {"id": "id", "name": "Personal"},
+    ]}}}
+
+    def test_open_real_run_uses_argv_without_shell(self):
+        target = {"exe": "/opt/brave/brave", "argv": ["/opt/brave/brave"],
+                  "running": True, "pid": 1}
+        with mock.patch.object(bc, "resolve_target", return_value=target), \
+                mock.patch.object(bc, "load_prefs", return_value=(self.PREFS, "/p")), \
+                mock.patch.object(bc, "launch_passthrough", return_value=["--user-data-dir=/p"]), \
+                mock.patch.object(bc.secrets, "token_urlsafe", return_value="nonce"), \
+                mock.patch.object(bc.subprocess, "Popen") as popen:
+            self.assertEqual(bc.cmd_open(1, dry_run=False), 0)
+        argv = popen.call_args.args[0]
+        self.assertIn("--container=Personal", argv)
+        self.assertEqual(popen.call_args.kwargs["start_new_session"], True)
+        self.assertIs(popen.call_args.kwargs["stdin"], bc.subprocess.DEVNULL)
+
+    def test_unsafe_target_and_malformed_preferences_never_launch(self):
+        with mock.patch.object(bc, "resolve_target", return_value={
+                "exe": "/opt/brave/brave", "argv": ["/opt/brave/brave"]}), \
+                mock.patch.object(bc, "load_prefs", return_value=({}, "/p")), \
+                mock.patch.object(bc.subprocess, "Popen") as popen:
+            self.assertEqual(bc.cmd_open(1, dry_run=False), 0)
+        with mock.patch.object(bc, "resolve_target", return_value={
+                "exe": "/opt/brave/brave", "argv": ["/opt/brave/brave"]}), \
+                mock.patch.object(bc, "load_prefs", return_value=(self.PREFS, "/p")), \
+                mock.patch.object(bc, "launch_passthrough", return_value=[]), \
+                mock.patch.object(bc.subprocess, "Popen") as popen:
+            with self.assertRaises(argparse.ArgumentTypeError):
+                bc.cmd_open(1, dry_run=False, url="javascript:alert(1)")
+            popen.assert_not_called()
+
+    def test_list_and_doctor_tolerate_malformed_preferences(self):
+        target = {"exe": "/opt/brave/brave", "argv": ["/opt/brave/brave"],
+                  "running": False, "pid": None}
+        with mock.patch.object(bc, "resolve_target", return_value=target), \
+                mock.patch.object(bc, "load_prefs", return_value=({}, "/p")), \
+                mock.patch.object(bc, "_existing_custom_keybindings", return_value=[]), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(bc.cmd_list(), 0)
+            self.assertEqual(bc.cmd_doctor(), 0)
+        self.assertIn("1=(empty)", output.getvalue())
+
+    def test_main_dispatch_and_error_codes(self):
+        for command, function, expected in (
+                ("list", "cmd_list", 11), ("doctor", "cmd_doctor", 12),
+                ("install", "cmd_install", 13), ("uninstall", "cmd_uninstall", 14)):
+            with self.subTest(command=command), \
+                    mock.patch.object(bc, function, return_value=expected) as handler:
+                args = [command]
+                self.assertEqual(bc.main(args), expected)
+                handler.assert_called_once()
+        for error, expected in ((bc.NoBraveFoundError("none"), 3),
+                                (bc.PreferencesUnreadableError("bad"), 4),
+                                (OSError("io"), 5),
+                                (subprocess.CalledProcessError(1, "gsettings"), 5),
+                                (ValueError("bad gsettings"), 5)):
+            with self.subTest(error=type(error).__name__), \
+                    mock.patch.object(bc, "cmd_list", side_effect=error), \
+                    contextlib.redirect_stderr(io.StringIO()) as stderr:
+                self.assertEqual(bc.main(["list"]), expected)
+                self.assertIn("error:", stderr.getvalue())
+
+    def test_install_and_uninstall_build_and_execute_plans(self):
+        existing = [{"path": "/custom/0/", "name": "foreign",
+                     "binding": "x", "command": "foreign"}]
+        with mock.patch.object(bc, "_existing_custom_keybindings",
+                               return_value=existing), \
+                mock.patch.object(bc, "_run_commands") as run:
+            self.assertEqual(bc.cmd_install(dry_run=True), 0)
+            self.assertEqual(bc.cmd_uninstall(dry_run=False), 0)
+        self.assertEqual(run.call_count, 2)
+        self.assertTrue(run.call_args_list[0].args[1])
+        self.assertFalse(run.call_args_list[1].args[1])
+
+    def test_doctor_reports_wayland_duplicates_and_conflicts(self):
+        target = {"exe": "/opt/brave.com/brave-origin-beta/brave",
+                  "argv": ["/opt/brave.com/brave-origin-beta/brave"],
+                  "running": True, "pid": 12}
+        prefs = {"brave": {"containers": {"list": [
+            {"id": "1", "name": "duplicate"},
+            {"id": "2", "name": "duplicate"},
+        ]}}}
+        existing = [
+            {"path": "/p/1/", "name": "someone-else",
+             "binding": "<Control><Shift>1", "command": "other"},
+            {"path": "/p/2/", "name": "brave-container-2",
+             "binding": "<Control><Shift>2", "command": "ours"},
+        ]
+        with mock.patch.object(bc, "resolve_target", return_value=target), \
+                mock.patch.object(bc, "load_prefs", return_value=(prefs, "/p/Preferences")), \
+                mock.patch.object(bc, "_wayland_native", return_value=True) as wayland, \
+                mock.patch.object(bc, "_existing_custom_keybindings", return_value=existing), \
+                mock.patch.dict(bc.os.environ, {"XDG_SESSION_TYPE": "wayland"}), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(bc.cmd_doctor(), 0)
+        wayland.assert_called_once_with(12)
+        self.assertIn("wayland-native: True", output.getvalue())
+        self.assertIn("duplicate container names", output.getvalue())
+        self.assertIn("already bound to", output.getvalue())
+
+    def test_doctor_treats_gsettings_read_failure_as_empty(self):
+        target = {"exe": "/opt/brave/brave", "argv": ["/opt/brave/brave"],
+                  "running": False, "pid": None}
+        with mock.patch.object(bc, "resolve_target", return_value=target), \
+                mock.patch.object(bc, "load_prefs", return_value=({}, "/p")), \
+                mock.patch.object(bc, "_existing_custom_keybindings",
+                                  side_effect=ValueError("bad gsettings")), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(bc.cmd_doctor(), 0)
+
 
 class MainOpenArgWiringTest(unittest.TestCase):
     """argparse -> cmd_open wiring for `open`, isolated from real Brave I/O
@@ -382,6 +799,13 @@ class MainOpenArgWiringTest(unittest.TestCase):
             bc.main(["open", "4", "--url", ""])
         self.assertEqual(caught.exception.code, 2)
 
+    def test_out_of_range_and_non_integer_slots_are_rejected_before_dispatch(self):
+        for slot in ("0", "10", "not-an-int"):
+            with self.subTest(slot=slot), self.assertRaises(SystemExit) as caught:
+                bc.main(["open", slot])
+            self.assertEqual(caught.exception.code, 2)
+        self.assertEqual(self.calls, [])
+
 
 @unittest.skipUnless(os.environ.get("BRAVE_SHORTCUT_E2E") == "1",
                       "set BRAVE_SHORTCUT_E2E=1 to run against real Brave")
@@ -405,7 +829,12 @@ class EndToEndTest(unittest.TestCase):
             self.assertEqual(argv[0], target["exe"])
             self.assertTrue(any(arg.startswith("--user-data-dir=") for arg in argv))
             self.assertEqual(argv[-2], f"--container={container['name']}")
-            self.assertEqual(argv[-1], bc.NEW_TAB_URL)
+            marker = urlsplit(argv[-1])
+            self.assertEqual(marker.netloc, "brave-container.invalid")
+            fields = parse_qs(marker.fragment)
+            self.assertEqual(fields["slot"], [str(slot)])
+            self.assertEqual(fields["target"], [bc.NEW_TAB_URL])
+            self.assertTrue(fields["nonce"][0])
 
 
 if __name__ == "__main__":

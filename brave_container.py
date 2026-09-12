@@ -6,12 +6,16 @@ See README.md for install, probe results, and known limits.
 """
 
 import argparse
+import ast
 import glob
+import ipaddress
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
+from urllib.parse import urlencode, urlsplit
 
 
 # ---------------------------------------------------------------------------
@@ -19,6 +23,12 @@ import sys
 # ---------------------------------------------------------------------------
 
 _HELPER_EXE_NAMES = {"bash", "sh", "chrome_crashpad_handler"}
+_BRAVE_EXE_NAMES = {
+    "brave", "brave-browser", "brave-browser-beta",
+    "brave-browser-dev", "brave-browser-nightly", "brave-browser-stable",
+    "brave-origin", "brave-origin-beta", "brave-origin-dev",
+    "brave-origin-nightly", "brave-origin-stable",
+}
 
 _MEDIA_KEYS_SCHEMA = "org.gnome.settings-daemon.plugins.media-keys"
 _CUSTOM_KEYBINDING_SCHEMA = _MEDIA_KEYS_SCHEMA + ".custom-keybinding"
@@ -41,24 +51,35 @@ def parse_ps(text):
     - shell wrappers and crashpad handlers
     - anything whose exe name doesn't look like a brave binary
     """
+    if not isinstance(text, str):
+        return []
     processes = []
     for line in text.splitlines():
         line = line.strip()
         if not line:
             continue
-        pid_str, _, rest = line.partition(" ")
+        fields = line.split(None, 1)
+        if len(fields) != 2:
+            continue
+        pid_str, rest = fields
+        if not re.fullmatch(r"[0-9]+", pid_str):
+            continue
+        try:
+            pid = int(pid_str)
+        except ValueError:
+            continue
+        if pid <= 0:
+            continue
         argv = rest.split()
         if not argv:
             continue
         if "--type=" in rest:
             continue
         exe = argv[0]
-        exe_name = os.path.basename(exe)
-        if exe_name in _HELPER_EXE_NAMES:
+        exe_name = os.path.basename(exe).lower()
+        if exe_name in _HELPER_EXE_NAMES or exe_name not in _BRAVE_EXE_NAMES:
             continue
-        if "brave" not in exe_name.lower():
-            continue
-        processes.append({"pid": int(pid_str), "exe": exe, "argv": argv})
+        processes.append({"pid": pid, "exe": exe, "argv": argv})
     return processes
 
 
@@ -130,14 +151,98 @@ def profile_dir_for(argv):
     return _switch_value(argv, "profile-directory") or "Default"
 
 
+def _validate_slot(slot):
+    if isinstance(slot, bool) or not isinstance(slot, int):
+        raise TypeError("slot must be an integer")
+    if not 1 <= slot <= 9:
+        raise ValueError(f"slot must be 1-9, got {slot}")
+
+
+def _slot_arg(value):
+    try:
+        slot = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError("slot must be an integer") from None
+    try:
+        _validate_slot(slot)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from None
+    return slot
+
+
 NEW_TAB_URL = "https://www.google.com/"
+_MARKER_HOST = "brave-container.invalid"
 
 
-def non_empty_url(value):
-    """Reject an explicit empty URL so every launch has a tab target."""
-    if not value:
-        raise argparse.ArgumentTypeError("URL must not be empty")
+def target_url(value):
+    """Validate a final tab target accepted by the marker protocol."""
+    if not isinstance(value, str):
+        raise argparse.ArgumentTypeError("invalid target URL")
+    if (not value or value != value.strip()
+            or value.startswith("-")
+            or any(c == "\\" or c.isspace() or ord(c) < 32 or ord(c) == 127
+                   for c in value)
+            or any(c in value for c in (";", "|", "$", "`", "<", ">"))
+            or re.search(r"%(?:0[0-9a-f]|1[0-9a-f]|7f)", value,
+                         re.IGNORECASE)):
+        raise argparse.ArgumentTypeError("invalid target URL")
+    parsed = None
+    hostname = ""
+    canonical_hostname = ""
+    authority_valid = True
+    try:
+        parsed = urlsplit(value)
+        _ = parsed.port  # Force validation of malformed/non-numeric ports.
+        valid = (
+            (parsed.scheme in {"http", "https"} and bool(parsed.hostname))
+            or (parsed.scheme == "file" and bool(parsed.path))
+            or value == "about:blank"
+        )
+        hostname = parsed.hostname or ""
+        try:
+            canonical_hostname = hostname.encode("idna").decode("ascii").lower()
+        except (UnicodeError, ValueError):
+            authority_valid = False
+        hostport = parsed.netloc.rsplit("@", 1)[-1]
+        if (parsed.scheme in {"http", "https"} and hostport.startswith("[")):
+            try:
+                ipaddress.IPv6Address(hostname)
+            except ipaddress.AddressValueError:
+                authority_valid = False
+        else:
+            host_without_dot = canonical_hostname.rstrip(".")
+            last_label = host_without_dot.rsplit(".", 1)[-1]
+            if re.fullmatch(r"(?:[0-9]+|0[xX][0-9a-fA-F]+)", last_label):
+                try:
+                    authority_valid = (
+                        str(ipaddress.IPv4Address(host_without_dot))
+                        == canonical_hostname)
+                except ipaddress.AddressValueError:
+                    authority_valid = False
+    except (ValueError, UnicodeError):
+        valid = False
+
+    if (not valid or not authority_valid or "%" in hostname
+            or canonical_hostname.rstrip(".") == _MARKER_HOST):
+        raise argparse.ArgumentTypeError(
+            "URL must use http, https, file, or be about:blank")
     return value
+
+
+def build_sort_marker(slot, target, nonce):
+    """Build the extension marker URL for one shortcut-managed tab."""
+    _validate_slot(slot)
+    if (not isinstance(nonce, str)
+            or not re.fullmatch(r"[A-Za-z0-9_-]+", nonce)):
+        raise ValueError("nonce must contain only ASCII letters, digits, _ or -")
+    fragment = urlencode({
+        "v": 1,
+        "action": "open",
+        "slot": slot,
+        "target": target_url(target),
+        "nonce": nonce,
+    })
+    return f"https://{_MARKER_HOST}/#{fragment}"
 
 
 def build_argv(exe, passthrough, name, url=None):
@@ -155,13 +260,23 @@ def build_argv(exe, passthrough, name, url=None):
 def container_for_slot(prefs, n):
     """Return {"id", "name"} for the Nth container (1-indexed), or None
     if there is no Nth container. n must be in 1..9."""
-    if not 1 <= n <= 9:
-        raise ValueError(f"slot must be 1-9, got {n}")
-    containers = prefs["brave"]["containers"]["list"]
-    if n > len(containers):
+    _validate_slot(n)
+    try:
+        containers = prefs["brave"]["containers"]["list"]
+        if not isinstance(containers, list) or n > len(containers):
+            return None
+        entry = containers[n - 1]
+        if not isinstance(entry, dict):
+            return None
+        container_id = entry.get("id")
+        name = entry.get("name")
+        if (not isinstance(container_id, str) or not container_id
+                or not isinstance(name, str) or not name
+                or "\x00" in container_id or "\x00" in name):
+            return None
+        return {"id": container_id, "name": name}
+    except (AttributeError, IndexError, KeyError, TypeError):
         return None
-    entry = containers[n - 1]
-    return {"id": entry["id"], "name": entry["name"]}
 
 
 def _custom_index(path):
@@ -222,7 +337,10 @@ def unbind_plan(existing):
     "brave-container-N" entries, leaving every foreign binding (and its
     path/name/binding/command) exactly as it was."""
     kept = [e["path"] for e in existing
-            if not e["name"].startswith(_NAME_PREFIX)]
+            if (isinstance(e, dict) and isinstance(e.get("path"), str)
+                and not (isinstance(e.get("name"), str)
+                         and re.fullmatch(r"brave-container-[1-9]",
+                                          e["name"])))]
     return {"commands": [["gsettings", "set", _MEDIA_KEYS_SCHEMA,
                            "custom-keybindings", str(kept)]]}
 
@@ -293,7 +411,7 @@ def load_prefs(target):
     try:
         with open(prefs_path, encoding="utf-8") as f:
             return json.load(f), prefs_path
-    except (OSError, json.JSONDecodeError) as e:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
         raise PreferencesUnreadableError(f"{prefs_path}: {e}") from e
 
 
@@ -316,7 +434,14 @@ def _wayland_native(pid):
 
 
 def _duplicate_container_names(prefs):
-    names = [c["name"] for c in prefs["brave"]["containers"]["list"]]
+    try:
+        containers = prefs["brave"]["containers"]["list"]
+    except (AttributeError, KeyError, TypeError):
+        return []
+    if not isinstance(containers, list):
+        return []
+    names = [c["name"] for c in containers
+             if isinstance(c, dict) and isinstance(c.get("name"), str)]
     return sorted({n for n in names if names.count(n) > 1})
 
 
@@ -331,14 +456,31 @@ def _existing_custom_keybindings():
     name/binding/command straight from gsettings (the live source of
     truth), as the {"path","name","binding","command"} shape
     gsettings_plan/unbind_plan expect."""
-    raw = _gsettings_get(_MEDIA_KEYS_SCHEMA, "custom-keybindings")
-    paths = [p for p in re.findall(r"'([^']*)'", raw) if p]
+    raw = _gsettings_get(_MEDIA_KEYS_SCHEMA, "custom-keybindings").strip()
+    if raw.startswith("@as"):
+        raw = raw[3:].strip()
+    try:
+        paths = ast.literal_eval(raw)
+    except (SyntaxError, ValueError) as e:
+        raise ValueError("invalid gsettings custom-keybindings value") from e
+    if (not isinstance(paths, list)
+            or not all(isinstance(path, str) for path in paths)):
+        raise ValueError("invalid gsettings custom-keybindings value")
+    paths = [path for path in paths if path]
     existing = []
     for path in paths:
         addr = f"{_CUSTOM_KEYBINDING_SCHEMA}:{path}"
-        name = _gsettings_get(addr, "name").strip("'")
-        binding = _gsettings_get(addr, "binding").strip("'")
-        command = _gsettings_get(addr, "command").strip("'")
+        values = []
+        for key in ("name", "binding", "command"):
+            raw_value = _gsettings_get(addr, key).strip()
+            try:
+                value = ast.literal_eval(raw_value)
+            except (SyntaxError, ValueError) as e:
+                raise ValueError(f"invalid gsettings {key} value") from e
+            if not isinstance(value, str):
+                raise ValueError(f"invalid gsettings {key} value")
+            values.append(value)
+        name, binding, command = values
         existing.append({"path": path, "name": name, "binding": binding,
                           "command": command})
     return existing
@@ -361,7 +503,11 @@ def cmd_open(slot, dry_run, url=None):
               file=sys.stderr)
         return 0
     passthrough = launch_passthrough(target["exe"], target["argv"])
-    argv = build_argv(target["exe"], passthrough, container["name"], url=url)
+    final_target = NEW_TAB_URL if url is None else url
+    marker = build_sort_marker(
+        slot, final_target, secrets.token_urlsafe(12))
+    argv = build_argv(
+        target["exe"], passthrough, container["name"], url=marker)
     if dry_run:
         print(" ".join(argv))
         return 0
@@ -410,7 +556,7 @@ def cmd_doctor():
               f"{', '.join(dupes)}")
     try:
         existing = _existing_custom_keybindings()
-    except (OSError, subprocess.CalledProcessError):
+    except (OSError, ValueError, subprocess.CalledProcessError):
         existing = []
     claimed = {e["binding"]: e["name"] for e in existing}
     for slot, binding in SHORTCUT_KEYS.items():
@@ -440,9 +586,9 @@ def main(argv=None):
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_open = sub.add_parser("open", help="open a new tab in slot N")
-    p_open.add_argument("slot", type=int)
+    p_open.add_argument("slot", type=_slot_arg)
     p_open.add_argument("--dry-run", action="store_true")
-    p_open.add_argument("--url", type=non_empty_url, default=None,
+    p_open.add_argument("--url", type=target_url, default=None,
                          help="override the new-tab URL (default: %s)"
                          % NEW_TAB_URL)
 
@@ -473,6 +619,9 @@ def main(argv=None):
     except PreferencesUnreadableError as e:
         print(f"error: {e}", file=sys.stderr)
         return 4
+    except (OSError, subprocess.CalledProcessError, ValueError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 5
     return 1
 
 

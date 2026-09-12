@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "Brave Container Tab Scheduler",
+  "version": "1.0.0",
+  "description": "Keeps shortcut-opened Brave container tabs in stable slot order.",
+  "permissions": ["tabs", "storage"],
+  "host_permissions": ["file:///*"],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "commands": {
+    "sort-all-managed": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+0"
+      },
+      "description": "Normalize shortcut-managed tabs in every window"
+    }
+  }
+}
